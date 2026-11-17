@@ -142,7 +142,7 @@ SETTINGS_EXPR = """c: {
     allowedSubstituters = c.security.nixProtectBarrior.build.allowedSubstituters or [];
     trustedPublicKeys = c.security.nixProtectBarrior.build.allowedPublicKeys or [];
     trustedUsers = c.security.nixProtectBarrior.build.trustedUsers or [ "root" ];
-    permittedInsecure = [];
+    permittedInsecure = c.nixpkgs.config.permittedInsecurePackages or [];
     enabled = false;
   };
 }"""
