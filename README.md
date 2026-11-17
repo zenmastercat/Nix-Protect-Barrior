@@ -11,6 +11,8 @@ A security layer for a NixOS desktop. It puts a gate in front of rebuilds and th
 | **verify** (weekly) | re-hashes every store path of the running system and the boot profile; repairs changed ones with a copy from a signed cache or a rebuild | tampered or corrupted store files |
 | **audit** (daily) | running Nix version, daemon trust, the live firewall rules, exposed ports, Docker-published ports, SSH password login, extra UID-0 users, `/etc/ld.so.preload`, new setuid files, new unmanaged `/etc` files, new or changed start-up files (autostart, shell rc, fish functions, git config, compositor configs, `~/.local/bin`, systemd user units, SSH keys, cron) | silent persistence, new exposure, rules that went missing |
 
+Documentation: [install and daily use](docs/INSTALL.md) · [security review and fixes, 2026-11-17](docs/REVIEW-2026-11-17.md)
+
 ## Use
 
 ```nix
