@@ -24,10 +24,14 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 
-POLICY = pathlib.Path(os.environ.get("NPB_POLICY", "/etc/nix-protect-barrior/policy.json"))
+ROOT = os.geteuid() == 0
+POLICY = pathlib.Path("/etc/nix-protect-barrior/policy.json" if ROOT else
+                      os.environ.get("NPB_POLICY", "/etc/nix-protect-barrior/policy.json"))
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 SEV_PRIO = {"high": 3, "medium": 4, "low": 5, "info": 6}
 
 HOME_WATCH = [
@@ -36,6 +40,8 @@ HOME_WATCH = [
     ".config/fish/config.fish", ".config/fish/conf.d", ".xprofile", ".xinitrc",
     ".ssh/authorized_keys", ".ssh/authorized_keys2", ".ssh/rc", ".pam_environment",
     ".local/share/nix/trusted-settings.json", ".config/nix/nix.conf",
+    ".gitconfig", ".config/git/config", ".config/fish/functions", ".local/bin",
+    ".config/mango", ".config/hypr", ".config/niri", ".config/sway", ".config/labwc",
 ]
 SYSTEM_WATCH = ["/var/spool/cron", "/etc/cron.d", "/root/.ssh/authorized_keys", "/root/.profile",
                 "/root/.bashrc", "/root/.config/nix/nix.conf"]
@@ -52,7 +58,8 @@ class Audit:
         self.findings = []
 
     def add(self, sev, check, msg):
-        self.findings.append({"severity": sev, "check": check, "message": msg})
+        # File names and user files are attacker-controlled: no control characters.
+        self.findings.append({"severity": sev, "check": check, "message": CONTROL.sub("?", msg)})
 
 
 def load_json(path, default):
@@ -78,7 +85,24 @@ def nix_config():
     return cfg
 
 
+def nix_patched(version, floors):
+    m = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
+    if not m:
+        return None
+    v = tuple(int(x or 0) for x in m.groups())
+    series = f"{v[0]}.{v[1]}"
+    if series in floors:
+        return v >= tuple(int(x) for x in floors[series].split("."))
+    return v >= (2, 36, 0)
+
+
 def check_nix(a, policy):
+    out = sh("nix", "--version")
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", out)
+    floors = policy.get("nixFloors", {})
+    if m and floors and nix_patched(m.group(1), floors) is False:
+        a.add("high", "nix", f"running Nix {m.group(1)} has known daemon vulnerabilities "
+                             "(CVE-2026-110450: any daemon user can get root); rebuild with a patched Nix")
     cfg = nix_config()
     if not cfg:
         a.add("medium", "nix", "could not read the Nix daemon settings")
@@ -160,11 +184,41 @@ def check_network(a, policy):
         m = re.search(r"-d (\S+)", line)
         dport = re.search(r"--dport (\d+)", line)
         if dport and not (m and m.group(1).startswith("127.")):
-            a.add("medium", "network", f"Docker publishes port {dport.group(1)} to the network "
-                                       "(Docker bypasses the NixOS firewall)")
+            port = int(dport.group(1))
+            kind = "udp" if " -p udp" in line else "tcp"
+            if in_ranges(port, lo.get(kind, []), lo.get(f"{kind}Ranges", [])):
+                a.add("high", "network", f"Docker publishes local-only port {kind}/{port} to the network "
+                                         "(Docker bypasses the firewall): bind it to 127.0.0.1")
+            else:
+                a.add("medium", "network", f"Docker publishes port {port} to the network "
+                                           "(Docker bypasses the NixOS firewall)")
+    check_live_rules(a, policy)
     ssh = policy.get("ssh", {})
     if ssh.get("enable") and ssh.get("passwordAuth") and not ssh.get("closed"):
         a.add("high", "network", "SSH accepts password logins from the network")
+
+
+def check_live_rules(a, policy):
+    """The local-only rules must really be in the running firewall."""
+    lo = policy.get("localOnly", {})
+    want = [("tcp", str(p)) for p in lo.get("tcp", [])] + [("udp", str(p)) for p in lo.get("udp", [])] + \
+           [("tcp", f"{r['from']}:{r['to']}") for r in lo.get("tcpRanges", [])] + \
+           [("udp", f"{r['from']}:{r['to']}") for r in lo.get("udpRanges", [])]
+    if not want:
+        return
+    if policy.get("nftables"):
+        if "chain input" not in sh("nft", "list", "table", "inet", "npb"):
+            a.add("high", "network", "the local-only firewall table (inet npb) is missing")
+        return
+    for tool in ("iptables", "ip6tables"):
+        rules = sh(tool, "-S", "nixos-fw")
+        if not rules:
+            a.add("high", "network", f"{tool}: the NixOS firewall chain is missing (firewall off?)")
+            continue
+        for proto, port in want:
+            if not re.search(rf"-p {proto} .*--dport {re.escape(port)} -j npb-local-only", rules):
+                a.add("high", "network", f"{tool}: local-only rule for {proto}/{port} is missing "
+                                         "(run: systemctl reload firewall)")
 
 
 # ------------------------------------------------------------------ system
@@ -209,14 +263,39 @@ def check_system(a, state, baseline, new_base):
             a.add("medium", "system", f"new file in /etc that NixOS does not manage: /etc/{n}")
 
 
+def read_nofollow(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read()
+    finally:
+        os.close(fd)
+
+
 def file_hashes(paths):
+    """Hash watched files without following symlinks (a symlink is recorded by its target)."""
     res = {}
     for base in paths:
         b = pathlib.Path(base)
-        files = [b] if b.is_file() else (sorted(x for x in b.rglob("*") if x.is_file()) if b.is_dir() else [])
+        if b.is_symlink():
+            files = [b]
+        elif b.is_dir():
+            files = sorted(x for x in b.rglob("*") if x.is_symlink() or x.is_file())
+        elif b.exists():
+            files = [b]
+        else:
+            files = []
         for f in files:
             try:
-                res[str(f)] = hashlib.sha256(f.read_bytes()).hexdigest()
+                if f.is_symlink():
+                    res[str(f)] = "symlink:" + os.readlink(f)
+                    continue
+                data = read_nofollow(f)
+                if data is not None:
+                    res[str(f)] = hashlib.sha256(data).hexdigest()
             except OSError:
                 pass
     return res
@@ -247,7 +326,8 @@ def main(argv=None):
     ap.add_argument("--accept", action="store_true", help="re-baseline watched files and setuid list")
     args = ap.parse_args(argv)
     policy = load_json(POLICY, {})
-    state = pathlib.Path(os.environ.get("NPB_STATE_DIR", policy.get("stateDir", "/var/lib/nix-protect-barrior")))
+    state = pathlib.Path(policy.get("stateDir", "/var/lib/nix-protect-barrior") if ROOT else
+                         os.environ.get("NPB_STATE_DIR", policy.get("stateDir", "/var/lib/nix-protect-barrior")))
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     base_file = state / "audit-baseline.json"
     baseline = {} if args.accept else load_json(base_file, {})

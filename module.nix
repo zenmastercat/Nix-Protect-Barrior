@@ -82,13 +82,101 @@ let
       passwordAuth = config.services.openssh.settings.PasswordAuthentication or true;
       closed = cfg.network.closeSsh;
     };
+    nftables = config.networking.nftables.enable;
+    inherit nixFloors;
+    # Snapshot of every switch; the gate fails when a new configuration weakens one.
+    hardening = {
+      barrier = true;
+      buildEnable = cfg.build.enable;
+      gateEnable = cfg.gate.enable;
+      gateAutoUpgrade = cfg.gate.autoUpgrade;
+      sysctls = cfg.runtime.sysctls;
+      restrictPtrace = cfg.runtime.restrictPtrace;
+      closeSsh = cfg.network.closeSsh;
+      dockerLocalOnly = cfg.network.dockerLocalOnly;
+      ollamaLocalOrigins = cfg.network.ollamaLocalOrigins;
+      verify = cfg.verify.enable;
+      autoRepair = cfg.verify.autoRepair;
+      audit = cfg.audit.enable;
+      localTcp = lo.tcp;
+      localUdp = lo.udp;
+      localTcpRanges = map (r: "${toString r.from}-${toString r.to}") lo.tcpRanges;
+      localUdpRanges = map (r: "${toString r.from}-${toString r.to}") lo.udpRanges;
+    };
   };
 
-  gateFlake =
+  # Auto-upgrade: update inputs in a temporary copy, freeze it, gate it fully,
+  # then build exactly that frozen copy.
+  au = config.system.autoUpgrade;
+  auRef = toString (au.flake or "");
+  auFlake = lib.head (lib.splitString "#" auRef);
+  auHost =
     let
-      f = toString (config.system.autoUpgrade.flake or "");
+      parts = lib.splitString "#" auRef;
     in
-    lib.head (lib.splitString "#" f);
+    if lib.length parts > 1 then lib.elemAt parts 1 else config.networking.hostName;
+  auFlags = lib.filter (f: !(lib.hasPrefix "--flake" f)) au.flags;
+  auUpdates =
+    lib.concatLists (
+      lib.imap0 (
+        i: f: lib.optional (f == "--update-input" && i + 1 < lib.length auFlags) (lib.elemAt auFlags (i + 1))
+      ) auFlags
+    );
+  auRecreate = lib.elem "--recreate-lock-file" auFlags;
+  auKeep =
+    let
+      drop = [ "--refresh" "--recreate-lock-file" "--no-write-lock-file" ];
+      go =
+        acc: rest:
+        if rest == [ ] then
+          acc
+        else if lib.head rest == "--update-input" then
+          go acc (lib.drop 2 rest)
+        else if lib.elem (lib.head rest) drop then
+          go acc (lib.tail rest)
+        else
+          go (acc ++ [ (lib.head rest) ]) (lib.tail rest);
+    in
+    go [ ] auFlags;
+  gatedUpgrade = pkgs.writeShellScript "npb-gated-upgrade" ''
+    set -euo pipefail
+    src="$(${pkg}/bin/npb-check archive --flake ${lib.escapeShellArg auFlake})"
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    mkdir "$work/flake"
+    cp -r --no-preserve=mode,ownership "$src"/. "$work/flake"/
+    ${lib.optionalString auRecreate ''nix flake update --flake "path:$work/flake"''}
+    ${lib.concatMapStrings (i: ''nix flake update ${lib.escapeShellArg i} --flake "path:$work/flake"
+    '') auUpdates}
+    frozen="$(${pkg}/bin/npb-check archive --flake "path:$work/flake")"
+    echo "npb: gating auto-upgrade of $frozen#${auHost}"
+    ${pkg}/bin/npb-check gate --flake "$frozen" --host ${lib.escapeShellArg auHost}
+    exec ${config.system.build.nixos-rebuild}/bin/nixos-rebuild ${au.operation} \
+      --flake "$frozen#${auHost}" ${lib.escapeShellArgs auKeep}
+  '';
+
+  sudo = if config.security.doas.enable then "doas" else "sudo";
+
+  # First patched release per series for the Nix daemon CVEs of 2026-10-13
+  # (CVE-2026-110450: unprivileged clients can corrupt store paths via the
+  # repair flag -> root; plus CVE-2026-110449/-110452/-110453).
+  nixFloors = {
+    "2.28" = "2.28.8";
+    "2.30" = "2.30.6";
+    "2.31" = "2.31.6";
+    "2.34" = "2.34.9";
+    "2.35" = "2.35.3";
+  };
+  nixPatched =
+    v:
+    let
+      series = lib.versions.majorMinor v;
+    in
+    if nixFloors ? ${series} then
+      lib.versionAtLeast v nixFloors.${series}
+    else
+      lib.versionAtLeast v "2.36";
+
 in
 {
   options.security.nixProtectBarrior = {
@@ -114,6 +202,11 @@ in
           Users the Nix daemon fully trusts. A trusted user can add caches and
           keys or turn the sandbox off for its builds, which equals root.
         '';
+      };
+      requirePatchedNix = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Refuse a Nix version with known daemon vulnerabilities (see nixFloors in module.nix).";
       };
       allowedUsers = mkOption {
         type = types.listOf types.str;
@@ -144,7 +237,19 @@ in
       autoUpgrade = mkOption {
         type = types.bool;
         default = true;
-        description = "Run the gate before system.autoUpgrade; a blocked gate stops the upgrade.";
+        description = ''
+          Gate system.autoUpgrade: inputs are updated in a temporary copy, which is
+          frozen, fully gated (closure scan included) and then built as is. A
+          blocked gate stops the upgrade.
+        '';
+      };
+      aliases = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Short shell commands: rebuild, rebuild-boot, barrier-status,
+          barrier-approve, barrier-audit, barrier-verify.
+        '';
       };
     };
 
@@ -243,6 +348,12 @@ in
 
   config = mkIf cfg.enable (mkMerge [
     {
+      assertions = [
+        {
+          assertion = !hasLocalOnly || config.networking.firewall.enable;
+          message = "Nix-Protect-Barrior: local-only ports need networking.firewall.enable = true.";
+        }
+      ];
       environment.systemPackages = [ pkg ];
       environment.etc."nix-protect-barrior/policy.json".text = builtins.toJSON policy;
       systemd.tmpfiles.rules = [ "d ${stateDir} 0700 root root -" ];
@@ -258,13 +369,36 @@ in
       };
       assertions =
         let
-          subs = (config.nix.settings.substituters or [ ]) ++ (config.nix.settings.trusted-substituters or [ ]);
+          ns = config.nix.settings;
+          subs =
+            (ns.substituters or [ ])
+            ++ (ns.extra-substituters or [ ])
+            ++ (ns.trusted-substituters or [ ])
+            ++ (ns.extra-trusted-substituters or [ ]);
           badSubs = lib.filter (s: !(lib.elem (norm s) (map norm cfg.build.allowedSubstituters))) subs;
           badKeys = lib.filter (k: !(lib.elem k cfg.build.allowedPublicKeys)) (
-            config.nix.settings.trusted-public-keys or [ ]
+            (ns.trusted-public-keys or [ ]) ++ (ns.extra-trusted-public-keys or [ ])
           );
+          badTrusted = lib.filter (u: !(lib.elem u cfg.build.trustedUsers)) (ns.extra-trusted-users or [ ]);
+          # nix.extraOptions is appended to nix.conf verbatim: it may not set trust.
+          trustKey = "(extra-)?(substituters|trusted-substituters|trusted-public-keys|trusted-users|allowed-users|sandbox|sandbox-fallback|require-sigs|accept-flake-config)";
+          badExtra = lib.filter (
+            l: builtins.match "[[:space:]]*(${trustKey}[[:space:]]*=.*|!?include[[:space:]].*)" l != null
+          ) (lib.splitString "\n" config.nix.extraOptions);
         in
         [
+          {
+            assertion = !cfg.build.requirePatchedNix || nixPatched config.nix.package.version;
+            message = "Nix-Protect-Barrior: Nix ${config.nix.package.version} has known daemon vulnerabilities (CVE-2026-110450: any daemon user can get root). Use a patched Nix, e.g. nix.package = pkgs.nixVersions.nix_2_34 (>= 2.34.9) or nixVersions.latest (>= 2.35.3).";
+          }
+          {
+            assertion = badTrusted == [ ];
+            message = "Nix-Protect-Barrior: extra-trusted-users would make these users root-equivalent: ${lib.concatStringsSep ", " badTrusted}";
+          }
+          {
+            assertion = badExtra == [ ];
+            message = "Nix-Protect-Barrior: nix.extraOptions may not set trust or include files; use nix.settings: ${lib.concatStringsSep " | " badExtra}";
+          }
           {
             assertion = badSubs == [ ];
             message = "Nix-Protect-Barrior: binary caches outside security.nixProtectBarrior.build.allowedSubstituters: ${lib.concatStringsSep ", " badSubs}";
@@ -281,16 +415,28 @@ in
         ];
     })
 
-    (mkIf (cfg.gate.enable && cfg.gate.autoUpgrade && config.system.autoUpgrade.enable) {
+    (mkIf (cfg.gate.enable && cfg.gate.autoUpgrade && au.enable && au.flake != null && !au.allowReboot) {
+      systemd.services.nixos-upgrade.path = [ pkg ];
+      systemd.services.nixos-upgrade.script = mkForce "exec ${gatedUpgrade}";
+    })
+
+    (mkIf (cfg.gate.enable && cfg.gate.autoUpgrade && au.enable && au.flake != null && au.allowReboot) {
+      # With reboots, NixOS's own upgrade script stays; the gate runs first on the
+      # current lock (input updates happen afterwards, inside nixos-rebuild).
       systemd.services.nixos-upgrade.serviceConfig.ExecStartPre = [
-        (pkgs.writeShellScript "npb-gate-autoupgrade" ''
-          flake=${lib.escapeShellArg gateFlake}
-          if [ -e "$flake/flake.nix" ]; then
-            exec ${pkg}/bin/npb-check gate --flake "$flake" --host ${lib.escapeShellArg config.networking.hostName} --fast
-          fi
-          echo "npb: auto-upgrade source $flake is not a local flake folder; gate skipped" >&2
-        '')
+        "${pkg}/bin/npb-check gate --flake ${lib.escapeShellArg auFlake} --host ${lib.escapeShellArg auHost}"
       ];
+    })
+
+    (mkIf (cfg.gate.enable && cfg.gate.aliases) {
+      environment.shellAliases = {
+        rebuild = "${sudo} npb-rebuild switch";
+        rebuild-boot = "${sudo} npb-rebuild boot";
+        barrier-status = "${sudo} npb-status";
+        barrier-approve = "${sudo} npb-check approve --flake /etc/nixos";
+        barrier-audit = "${sudo} systemctl start nix-protect-barrior-audit.service; ${sudo} npb-status";
+        barrier-verify = "${sudo} systemctl start nix-protect-barrior-verify.service; ${sudo} npb-status";
+      };
     })
 
     (mkIf (hasLocalOnly && !config.networking.nftables.enable) {
@@ -298,10 +444,10 @@ in
         ip46tables -N npb-local-only 2>/dev/null || ip46tables -F npb-local-only
         ${lib.concatMapStrings (i: "ip46tables -A npb-local-only -i ${i} -j RETURN\n") cfg.network.localInterfaces}
         ip46tables -A npb-local-only -j nixos-fw-refuse
-        ${lib.concatMapStrings (r: "ip46tables -I nixos-fw 1 ${r} -j npb-local-only\n") rules}
+        ${lib.concatMapStrings (r: "while ip46tables -D nixos-fw ${r} -j npb-local-only 2>/dev/null; do :; done\nip46tables -I nixos-fw 1 ${r} -j npb-local-only\n") rules}
       '';
       networking.firewall.extraStopCommands = ''
-        ${lib.concatMapStrings (r: "ip46tables -D nixos-fw ${r} -j npb-local-only 2>/dev/null || true\n") rules}
+        ${lib.concatMapStrings (r: "while ip46tables -D nixos-fw ${r} -j npb-local-only 2>/dev/null; do :; done\n") rules}
         ip46tables -F npb-local-only 2>/dev/null || true
         ip46tables -X npb-local-only 2>/dev/null || true
       '';
@@ -323,7 +469,12 @@ in
     })
 
     (mkIf cfg.network.dockerLocalOnly {
-      virtualisation.docker.daemon.settings.ip = "127.0.0.1";
+      virtualisation.docker.daemon.settings = {
+        # default bridge
+        ip = "127.0.0.1";
+        # every new user-defined network (docker compose)
+        default-network-opts.bridge."com.docker.network.bridge.host_binding_ipv4" = "127.0.0.1";
+      };
     })
 
     (mkIf cfg.network.ollamaLocalOrigins {

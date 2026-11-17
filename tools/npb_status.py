@@ -1,10 +1,13 @@
 """npb-status: show the latest Nix-Protect-Barrior audit and store check."""
 import json
+import re
 import os
 import pathlib
 import sys
 
-POLICY = pathlib.Path(os.environ.get("NPB_POLICY", "/etc/nix-protect-barrior/policy.json"))
+ROOT = os.geteuid() == 0
+POLICY = pathlib.Path("/etc/nix-protect-barrior/policy.json" if ROOT else
+                      os.environ.get("NPB_POLICY", "/etc/nix-protect-barrior/policy.json"))
 
 
 def load(path):
@@ -16,7 +19,8 @@ def load(path):
 
 def main():
     policy = load(POLICY) or {}
-    state = pathlib.Path(os.environ.get("NPB_STATE_DIR", policy.get("stateDir", "/var/lib/nix-protect-barrior")))
+    state = pathlib.Path(policy.get("stateDir", "/var/lib/nix-protect-barrior") if ROOT else
+                         os.environ.get("NPB_STATE_DIR", policy.get("stateDir", "/var/lib/nix-protect-barrior")))
     if not os.access(state, os.R_OK | os.X_OK):
         print(f"npb-status: {state} is root-only; run: doas npb-status")
         return 2
@@ -28,7 +32,8 @@ def main():
         print(f"  audit   {audit['time']}: {c['high']} high, {c['medium']} medium, {c['low']} low")
         for f in audit["findings"]:
             if f["severity"] in ("high", "medium"):
-                print(f"    {f['severity'].upper():6} [{f['check']}] {f['message']}")
+                msg = re.sub(r"[\x00-\x1f\x7f]", "?", f["message"])
+                print(f"    {f['severity'].upper():6} [{f['check']}] {msg}")
     else:
         print("  audit   no report yet (systemctl start nix-protect-barrior-audit)")
     if verify:

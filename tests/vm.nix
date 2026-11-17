@@ -82,7 +82,23 @@
         attacker.succeed("curl -sf --max-time 5 http://pc:8080/ >/dev/null")
         pc.succeed("nc -z -w 3 127.0.0.1 22")
 
+    with subtest("network barrier survives a firewall reload; a deleted rule is reported"):
+        pc.succeed("systemctl reload firewall")
+        attacker.fail("curl -sf --max-time 5 http://pc:11434/")
+        assert pc.succeed("iptables -S nixos-fw | grep -c 'dport 11434 -j npb-local-only'").strip() == "1"
+        pc.succeed("iptables -D nixos-fw -p tcp --dport 11434 -j npb-local-only")
+        pc.succeed("systemctl start nix-protect-barrior-audit.service")
+        rep = json.loads(pc.succeed("cat /var/lib/nix-protect-barrior/audit-latest.json"))
+        assert any("tcp/11434 is missing" in f["message"] for f in rep["findings"]), rep
+        pc.succeed("systemctl reload firewall")
+        attacker.fail("curl -sf --max-time 5 http://pc:11434/")
+
+    with subtest("short commands exist"):
+        pc.succeed("bash -ic 'type rebuild' | grep -q npb-rebuild")
+        pc.succeed("bash -ic 'type barrier-status' | grep -q npb-status")
+
     with subtest("audit: baseline, then a planted setuid file and autostart entry are reported"):
+        pc.succeed("rm -f /var/lib/nix-protect-barrior/audit-baseline.json")
         pc.succeed("systemctl start nix-protect-barrior-audit.service")
         pc.succeed("install -m 4755 $(readlink -f /run/current-system/sw/bin/hello) /root/planted-suid")
         pc.succeed("mkdir -p /home/alice/.config/autostart && echo '[Desktop Entry]' > /home/alice/.config/autostart/x.desktop")

@@ -19,7 +19,9 @@ import re
 import subprocess
 import sys
 
-POLICY = pathlib.Path(os.environ.get("NPB_POLICY", "/etc/nix-protect-barrior/policy.json"))
+ROOT = os.geteuid() == 0
+POLICY = pathlib.Path("/etc/nix-protect-barrior/policy.json" if ROOT else
+                      os.environ.get("NPB_POLICY", "/etc/nix-protect-barrior/policy.json"))
 DEFAULT_ROOTS = ["/run/current-system", "/nix/var/nix/profiles/system"]
 MODIFIED = re.compile(r"path '(/nix/store/[^']+)' was modified")
 
@@ -34,7 +36,8 @@ def main(argv=None):
         policy = json.loads(POLICY.read_text())
     except (OSError, ValueError):
         policy = {}
-    state = pathlib.Path(os.environ.get("NPB_STATE_DIR", policy.get("stateDir", "/var/lib/nix-protect-barrior")))
+    state = pathlib.Path(policy.get("stateDir", "/var/lib/nix-protect-barrior") if ROOT else
+                         os.environ.get("NPB_STATE_DIR", policy.get("stateDir", "/var/lib/nix-protect-barrior")))
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     roots = [r for r in (args.roots or DEFAULT_ROOTS) if os.path.exists(r)]
 

@@ -7,6 +7,7 @@
   nix,
   iproute2,
   iptables,
+  nftables,
   findutils,
   coreutils,
   hostname,
@@ -24,7 +25,7 @@ stdenvNoCC.mkDerivation {
     for t in check audit verify status; do
       makeWrapper ${python3}/bin/python3 $out/bin/npb-$t \
         --add-flags "-I $out/libexec/npb/npb_$t.py" \
-        --prefix PATH : ${lib.makeBinPath [ nix iproute2 iptables findutils coreutils ]}
+        --prefix PATH : ${lib.makeBinPath [ nix iproute2 iptables nftables findutils coreutils ]}
     done
     makeWrapper ${bash}/bin/bash $out/bin/npb-rebuild \
       --add-flags $out/libexec/npb/npb-rebuild.sh \
